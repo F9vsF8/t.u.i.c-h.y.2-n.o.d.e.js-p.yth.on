@@ -1,12 +1,12 @@
 #!/bin/bash
 set -euo pipefail
-
 export LC_ALL=C
 IFS=$'\n\t'
 
 TUIC_BIN="./tuic-server"
 CONFIG="./config.json"
-KEYS="./reality_keys.json"
+KEY_FILE="./reality_private_key.b64"
+SID_FILE="./reality_short_id"
 LINK="./tuic_reality_link.txt"
 
 REALITY_DOMAIN="www.cloudflare.com"
@@ -17,31 +17,39 @@ download_tuic() {
         echo "✔ TUIC 已存在"
         return
     fi
-    echo "📥 下载支持 REALITY 的 TUIC"
+    echo "📥 下载支持 REALITY 的 TUIC（请确保该 URL 可用）"
     curl -L -o "$TUIC_BIN" \
       https://github.com/CarsonFeng/tuic/releases/latest/download/tuic-server-linux-amd64
     chmod +x "$TUIC_BIN"
 }
 
 gen_reality_keys() {
-    if [[ -f "$KEYS" ]]; then
+    if [[ -f "$KEY_FILE" && -f "$SID_FILE" ]]; then
         echo "✔ REALITY 密钥已存在"
         return
     fi
 
-    echo "🔑 生成 REALITY 私钥与公钥"
-    cat > "$KEYS" <<EOF
-{
-  "private_key": "$(openssl genpkey -algorithm X25519 | base64)",
-  "short_id": "$(openssl rand -hex 8)"
-}
-EOF
+    echo "🔑 生成 REALITY 私钥与 short_id（并以 base64 存储私钥）"
+    # 生成 X25519 私钥（PEM），然后 base64 编码保存为单行
+    openssl genpkey -algorithm X25519 -out /tmp/reality_x25519.pem
+    base64 -w0 /tmp/reality_x25519.pem > "$KEY_FILE"
+    rm -f /tmp/reality_x25519.pem
+
+    # short id
+    openssl rand -hex 8 > "$SID_FILE"
+    echo "✔ 生成完成： $KEY_FILE, $SID_FILE"
 }
 
 gen_config() {
-    PRIVATE_KEY=$(jq -r .private_key "$KEYS")
-    SHORT_ID=$(jq -r .short_id "$KEYS")
+    if [[ ! -f "$KEY_FILE" || ! -f "$SID_FILE" ]]; then
+        echo "ERROR: missing keys. Run gen_reality_keys first." >&2
+        exit 1
+    fi
+
+    PRIVATE_KEY_B64=$(cat "$KEY_FILE")
+    SHORT_ID=$(cat "$SID_FILE")
     UUID=$(cat /proc/sys/kernel/random/uuid)
+    PASSWORD=$(openssl rand -hex 16)
 
 cat > "$CONFIG" <<EOF
 {
@@ -53,7 +61,7 @@ cat > "$CONFIG" <<EOF
       "server": "::",
       "server_port": ${PORT},
       "uuid": "${UUID}",
-      "password": "$(openssl rand -hex 16)",
+      "password": "${PASSWORD}",
       "congestion_control": "bbr",
       "alpn": ["h3"],
       "zero_rtt": true,
@@ -61,27 +69,27 @@ cat > "$CONFIG" <<EOF
       "reality": {
         "enabled": true,
         "handshake_server_name": "${REALITY_DOMAIN}",
-        "private_key": "${PRIVATE_KEY}",
+        "private_key": "${PRIVATE_KEY_B64}",
         "short_ids": ["${SHORT_ID}"]
       }
     }
   ]
 }
 EOF
+
+    echo "✔ config.json 已生成"
 }
 
 gen_link() {
-    PRIVATE_KEY=$(jq -r .private_key "$KEYS")
-    SHORT_ID=$(jq -r .short_id "$KEYS")
-    UUID=$(jq -r .inbounds[0].uuid "$CONFIG")
-    PASSWORD=$(jq -r .inbounds[0].password "$CONFIG")
+    # 读取刚写入的 config 来获取 uuid/password（无需 jq）
+    UUID=$(grep -Po '"uuid"\s*:\s*"\K[^"]+' "$CONFIG")
+    PASSWORD=$(grep -Po '"password"\s*:\s*"\K[^"]+' "$CONFIG")
+    PRIVATE_KEY_B64=$(cat "$KEY_FILE")
+    SHORT_ID=$(cat "$SID_FILE")
     IP=$(curl -s https://api64.ipify.org || echo "YOUR_IP")
 
 cat > "$LINK" <<EOF
-tuic://${UUID}:${PASSWORD}@${IP}:${PORT}?
-allowInsecure=0&congestion_control=bbr&alpn=h3&
-sni=${REALITY_DOMAIN}&disable_sni=0&
-pbk=${PRIVATE_KEY}&sid=${SHORT_ID}
+tuic://${UUID}:${PASSWORD}@${IP}:${PORT}?allowInsecure=0&congestion_control=bbr&alpn=h3&sni=${REALITY_DOMAIN}&disable_sni=0&pbk=${PRIVATE_KEY_B64}&sid=${SHORT_ID}
 #TUIC-REALITY-${IP}
 EOF
 
@@ -92,7 +100,7 @@ EOF
 }
 
 run_tuic() {
-    echo "🚀 启动 TUIC REALITY ..."
+    echo "🚀 启动 TUIC REALITY（按 Ctrl+C 停止）..."
     while true; do
         "$TUIC_BIN" -c "$CONFIG"
         echo "⚠️ TUIC 崩溃，5 秒后重启"
@@ -100,6 +108,7 @@ run_tuic() {
     done
 }
 
+# 主流程
 download_tuic
 gen_reality_keys
 gen_config
